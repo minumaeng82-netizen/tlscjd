@@ -1,348 +1,117 @@
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>김천다수초 메이커 프로그램 체험 신청</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <!-- 실시간 다중 접속 공유를 위한 Supabase CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" rel="stylesheet">
-  <style>
-    body { font-family: 'Pretendard', sans-serif; background-color: #fdf8f3; }
-  </style>
-</head>
-<body class="text-stone-800 antialiased">
+-- Supabase SQL Editor에서 실행하세요. 기존 신청 데이터는 유지합니다.
+-- 먼저 아래 한 곳의 새 비밀번호를 반드시 수정하세요. HTML에는 넣지 않습니다.
+BEGIN;
+CREATE SCHEMA IF NOT EXISTS sticker_private;
+REVOKE ALL ON SCHEMA sticker_private FROM PUBLIC, anon, authenticated;
+CREATE TABLE IF NOT EXISTS sticker_private.settings (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  salt text NOT NULL, password_hash text NOT NULL
+);
+DO $$
+DECLARE
+  new_password text := 'CHANGE_THIS_TO_A_NEW_PASSWORD'; -- 이 따옴표 안을 새 비밀번호로 변경
+  new_salt text := gen_random_uuid()::text;
+BEGIN
+  IF new_password = 'CHANGE_THIS_TO_A_NEW_PASSWORD' OR length(new_password) < 12 THEN
+    RAISE EXCEPTION 'SQL 위쪽 new_password를 12자 이상의 새 관리자 비밀번호로 바꿔 주세요.';
+  END IF;
+  INSERT INTO sticker_private.settings(singleton,salt,password_hash)
+  VALUES(true,new_salt,encode(sha256(convert_to(new_salt || new_password,'UTF8')),'hex'))
+  ON CONFLICT(singleton) DO UPDATE SET salt=EXCLUDED.salt,password_hash=EXCLUDED.password_hash;
+END $$;
 
-  <div class="max-w-5xl mx-auto px-4 py-8">
-    <!-- 상단 헤더 -->
-    <header class="bg-[#8b5a3c] text-white rounded-2xl p-6 shadow-md mb-6 text-center relative overflow-hidden">
-      <p class="text-sm font-medium text-amber-200 mb-1">김천다수초등학교 메이커 프로그램</p>
-      <h1 class="text-2xl md:text-3xl font-extrabold tracking-tight">나만의 스티커 만들기 체험 신청</h1>
-      <p class="text-xs md:text-sm text-stone-200 mt-2">
-        원하는 날짜의 <span class="bg-white/20 px-1.5 py-0.5 rounded font-bold">+ 신청</span> 버튼을 눌러 이름을 등록하세요. (일일 최대 8명)
-      </p>
-      <div id="mode-badge" class="mt-3 inline-block text-xs px-3 py-1 rounded-full bg-amber-900/60 text-amber-100">
-        데이터 연동 확인 중...
-      </div>
-    </header>
+CREATE TABLE IF NOT EXISTS public.sticker_reservations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  event_date date NOT NULL,
+  student_name text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+-- 기존 테이블은 원래 열(id, event_date, student_name, created_at)이 있다는 전제입니다.
+LOCK TABLE public.sticker_reservations IN ACCESS EXCLUSIVE MODE;
+CREATE TABLE IF NOT EXISTS sticker_private.daily_capacity (
+  event_date date PRIMARY KEY,
+  used integer NOT NULL CHECK (used BETWEEN 0 AND 8)
+);
+DO $$ BEGIN
+  IF EXISTS(SELECT 1 FROM public.sticker_reservations GROUP BY event_date HAVING count(*) > 8) THEN
+    RAISE EXCEPTION '이미 8명을 초과한 날짜가 있습니다. 기존 명단을 정리한 후 다시 실행하세요.';
+  END IF;
+END $$;
+DELETE FROM sticker_private.daily_capacity;
+INSERT INTO sticker_private.daily_capacity(event_date,used)
+SELECT event_date,count(*)::integer FROM public.sticker_reservations GROUP BY event_date;
 
-    <!-- 11월 달력 컨트롤 & 안내 -->
-    <div class="flex flex-wrap items-center justify-between gap-2 mb-4 px-1">
-      <h2 class="text-xl font-bold text-[#6d432a]">2026년 11월 체험 일정표</h2>
-      <div class="flex items-center gap-3 text-xs text-stone-600">
-        <span class="flex items-center gap-1"><span class="w-3 h-3 rounded-full bg-emerald-500 inline-block"></span> 신청 가능</span>
-        <span class="flex items-center gap-1"><span class="w-3 h-3 rounded-full bg-rose-500 inline-block"></span> 마감 (8/8명)</span>
-      </div>
-    </div>
+CREATE OR REPLACE FUNCTION sticker_private.enforce_capacity()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+DECLARE accepted integer;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.event_date IS NULL OR NEW.event_date < DATE '2026-11-01'
+       OR NEW.event_date >= DATE '2026-12-01'
+       OR extract(isodow FROM NEW.event_date) IN (6,7) THEN
+      RAISE EXCEPTION '신청 가능한 2026년 11월 평일을 선택하세요.';
+    END IF;
+    NEW.student_name := btrim(NEW.student_name);
+    IF NEW.student_name IS NULL OR length(NEW.student_name) NOT BETWEEN 2 AND 40 THEN
+      RAISE EXCEPTION '학년·반·이름을 2~40자로 입력하세요.';
+    END IF;
+    -- 같은 날짜의 카운터 행을 원자적으로 갱신합니다.
+    -- 동시 요청은 이 행에서 직렬화되며, 실패/롤백 시 증원도 함께 취소됩니다.
+    INSERT INTO sticker_private.daily_capacity AS cap(event_date,used)
+    VALUES(NEW.event_date,1)
+    ON CONFLICT(event_date) DO UPDATE SET used = cap.used + 1 WHERE cap.used < 8
+    RETURNING used INTO accepted;
+    IF accepted IS NULL THEN RAISE EXCEPTION '정원 8명이 마감되었습니다. 다른 날짜를 선택하세요.'; END IF;
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    UPDATE sticker_private.daily_capacity SET used = used - 1 WHERE event_date = OLD.event_date;
+    RETURN OLD;
+  ELSE
+    RAISE EXCEPTION '기존 신청은 직접 수정할 수 없습니다. 삭제 후 다시 신청하세요.';
+  END IF;
+END $$;
+DROP TRIGGER IF EXISTS sticker_capacity_guard ON public.sticker_reservations;
+CREATE TRIGGER sticker_capacity_guard BEFORE INSERT OR DELETE OR UPDATE
+ON public.sticker_reservations FOR EACH ROW EXECUTE FUNCTION sticker_private.enforce_capacity();
+CREATE INDEX IF NOT EXISTS sticker_reservations_date_created_idx
+ON public.sticker_reservations(event_date,created_at);
 
-    <!-- 요일 헤더 -->
-    <div class="grid grid-cols-7 gap-1.5 md:gap-2.5 text-center font-bold text-sm mb-2">
-      <div class="text-rose-600 py-1">일</div>
-      <div class="text-stone-700 py-1">월</div>
-      <div class="text-stone-700 py-1">화</div>
-      <div class="text-stone-700 py-1">수</div>
-      <div class="text-stone-700 py-1">목</div>
-      <div class="text-stone-700 py-1">금</div>
-      <div class="text-blue-600 py-1">토</div>
-    </div>
+ALTER TABLE public.sticker_reservations ENABLE ROW LEVEL SECURITY;
+-- 이 테이블의 기존 정책을 새 정책으로 교체합니다. 다른 테이블에는 영향이 없습니다.
+DO $$ DECLARE p record; BEGIN
+  FOR p IN SELECT policyname FROM pg_policies
+           WHERE schemaname='public' AND tablename='sticker_reservations' LOOP
+    EXECUTE format('DROP POLICY %I ON public.sticker_reservations', p.policyname);
+  END LOOP;
+END $$;
+REVOKE ALL ON public.sticker_reservations FROM PUBLIC, anon, authenticated;
+GRANT SELECT ON public.sticker_reservations TO anon, authenticated;
+GRANT INSERT(event_date,student_name) ON public.sticker_reservations TO anon, authenticated;
+CREATE POLICY sticker_read ON public.sticker_reservations FOR SELECT TO anon,authenticated USING(true);
+CREATE POLICY sticker_insert ON public.sticker_reservations FOR INSERT TO anon,authenticated WITH CHECK(true);
 
-    <!-- 달력 그리드 -->
-    <div id="calendar-grid" class="grid grid-cols-7 gap-1.5 md:gap-2.5"></div>
-  </div>
+CREATE OR REPLACE FUNCTION public.delete_sticker_reservation(p_id text,p_password text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM sticker_private.settings
+    WHERE singleton AND password_hash=encode(sha256(convert_to(salt || p_password,'UTF8')),'hex')
+  ) THEN RAISE EXCEPTION '관리자 비밀번호가 일치하지 않습니다.'; END IF;
+  DELETE FROM public.sticker_reservations WHERE id::text=p_id;
+  IF NOT FOUND THEN RAISE EXCEPTION '이미 삭제되었거나 존재하지 않는 신청입니다.'; END IF;
+END $$;
+REVOKE ALL ON FUNCTION public.delete_sticker_reservation(text,text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.delete_sticker_reservation(text,text) TO anon,authenticated;
+REVOKE ALL ON ALL TABLES IN SCHEMA sticker_private FROM PUBLIC,anon,authenticated;
+REVOKE ALL ON FUNCTION sticker_private.enforce_capacity() FROM PUBLIC,anon,authenticated;
 
-  <!-- 신청 등록 모달 -->
-  <div id="add-modal" class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50 p-4">
-    <div class="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl">
-      <h3 class="text-lg font-bold text-stone-800 mb-1">체험 신청하기</h3>
-      <p id="modal-date-label" class="text-sm text-[#8b5a3c] font-semibold mb-4"></p>
-      
-      <label class="block text-xs font-semibold text-stone-600 mb-1">학년 반 이름 (예: 4-2 홍길동)</label>
-      <input type="text" id="applicant-name" placeholder="학년-반 이름을 입력하세요" 
-             class="w-full border border-stone-300 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#8b5a3c] mb-4" />
-      
-      <div class="flex justify-end gap-2">
-        <button onclick="closeAddModal()" class="px-4 py-2 text-sm font-medium text-stone-600 hover:bg-stone-100 rounded-xl">취소</button>
-        <button onclick="submitApplicant()" class="px-4 py-2 text-sm font-bold text-white bg-[#8b5a3c] hover:bg-[#73482e] rounded-xl">등록하기</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- 삭제 비밀번호 확인 모달 -->
-  <div id="delete-modal" class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50 p-4">
-    <div class="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl">
-      <h3 class="text-lg font-bold text-rose-600 mb-1">신청 내역 삭제</h3>
-      <p id="delete-target-label" class="text-sm text-stone-600 mb-4"></p>
-      
-      <label class="block text-xs font-semibold text-stone-600 mb-1">관리자 비밀번호</label>
-      <input type="password" id="admin-password" placeholder="비밀번호를 입력하세요" 
-             class="w-full border border-stone-300 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-rose-500 mb-4" />
-      
-      <div class="flex justify-end gap-2">
-        <button onclick="closeDeleteModal()" class="px-4 py-2 text-sm font-medium text-stone-600 hover:bg-stone-100 rounded-xl">취소</button>
-        <button onclick="confirmDelete()" class="px-4 py-2 text-sm font-bold text-white bg-rose-600 hover:bg-rose-700 rounded-xl">삭제하기</button>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    // =========================================================================
-    // [설정 영역] Supabase 연결 정보 (비워두면 현재 기기 브라우저에만 임시 저장됩니다)
-    // =========================================================================
-    const SUPABASE_URL = "https://thouylmffwzguocsrsvy.supabase.co";
-    const SUPABASE_ANON_KEY = "sb_publishable_9Vrx2eDjvWkCj4MQSG_KQg_kw8DjQmg";
-    
-    const ADMIN_PW = "ektn5759!!";
-    const MAX_CAPACITY = 8;
-    const TARGET_YEAR = 2026;
-    const TARGET_MONTH = 11; // 11월
-    // =========================================================================
-
-    let supabaseClient = null;
-    if (SUPABASE_URL && SUPABASE_ANON_KEY) {
-      supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-      document.getElementById("mode-badge").textContent = "🟢 실시간 클라우드 DB 연동됨";
-    } else {
-      document.getElementById("mode-badge").textContent = "🟡 로컬 테스트 모드 (다중 기기 공유 시 Supabase 키 입력 필요)";
-    }
-
-    // 데이터 저장소: { "2026-11-17": [ { id: "...", name: "4-1 김철수" }, ... ] }
-    let registrations = {};
-    let selectedDateStr = "";
-    let deleteTarget = { dateStr: "", id: "", name: "" };
-
-    // 초기 데이터 불러오기
-    async function loadRegistrations() {
-      if (supabaseClient) {
-        const { data, error } = await supabaseClient
-          .from("sticker_reservations")
-          .select("*")
-          .order("created_at", { ascending: true });
-
-        if (!error && data) {
-          registrations = {};
-          data.forEach(row => {
-            if (!registrations[row.event_date]) registrations[row.event_date] = [];
-            registrations[row.event_date].push({ id: row.id, name: row.student_name });
-          });
-        }
-      } else {
-        const saved = localStorage.getItem("dasu_sticker_2026_11");
-        registrations = saved ? JSON.parse(saved) : {};
-      }
-      renderCalendar();
-    }
-
-    // 로컬 저장 헬퍼
-    function saveLocal() {
-      localStorage.setItem("dasu_sticker_2026_11", JSON.stringify(registrations));
-    }
-
-    // 11월 달력 렌더링
-    function renderCalendar() {
-      const grid = document.getElementById("calendar-grid");
-      grid.innerHTML = "";
-
-      const firstDay = new Date(TARGET_YEAR, TARGET_MONTH - 1, 1).getDay(); // 0(일) ~ 6(토)
-      const daysInMonth = new Date(TARGET_YEAR, TARGET_MONTH, 0).getDate(); // 30일
-
-      // 1일 이전 빈 칸 채우기
-      for (let i = 0; i < firstDay; i++) {
-        const emptyCell = document.createElement("div");
-        emptyCell.className = "bg-stone-100/60 rounded-xl min-h-[120px] md:min-h-[150px]";
-        grid.appendChild(emptyCell);
-      }
-
-      // 1일 ~ 30일 생성
-      for (let day = 1; day <= daysInMonth; day++) {
-        const dateStr = `${TARGET_YEAR}-${String(TARGET_MONTH).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-        const dayOfWeek = new Date(TARGET_YEAR, TARGET_MONTH - 1, day).getDay();
-        const isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
-        
-        const list = registrations[dateStr] || [];
-        const isFull = list.length >= MAX_CAPACITY;
-
-        const cell = document.createElement("div");
-        cell.className = `bg-white border ${isFull ? 'border-rose-200 bg-rose-50/30' : 'border-stone-200'} rounded-xl p-2 md:p-3 min-h-[130px] md:min-h-[165px] flex flex-col justify-between shadow-sm`;
-
-        // 상단 날짜 + 인원수 + '+' 버튼
-        let dateColor = "text-stone-800";
-        if (dayOfWeek === 0) dateColor = "text-rose-600";
-        if (dayOfWeek === 6) dateColor = "text-blue-600";
-
-        const headerHtml = `
-          <div class="flex items-center justify-between mb-2 pb-1 border-b border-stone-100">
-            <div class="flex items-center gap-1.5">
-              <span class="font-bold text-sm md:text-base ${dateColor}">${day}</span>
-              <span class="text-[11px] font-semibold px-1.5 py-0.5 rounded-full ${isFull ? 'bg-rose-100 text-rose-700' : 'bg-amber-100 text-amber-800'}">
-                ${list.length}/${MAX_CAPACITY}
-              </span>
-            </div>
-            ${!isFull && !isWeekend ? `
-              <button onclick="openAddModal('${dateStr}')" title="체험 신청 추가"
-                class="w-6 h-6 rounded-full bg-[#8b5a3c] hover:bg-[#6d432a] text-white flex items-center justify-center font-bold text-sm shadow-sm transition">
-                +
-              </button>
-            ` : isFull ? `
-              <span class="text-[11px] font-bold text-rose-600">마감</span>
-            ` : `
-              <span class="text-[10px] text-stone-400">주말</span>
-            `}
-          </div>
-        `;
-
-        // 신청자 명단 리스트
-        const listHtml = `
-          <div class="space-y-1 flex-1 overflow-y-auto max-h-[115px]">
-            ${list.map((item, idx) => `
-              <div class="flex items-center justify-between bg-stone-50 hover:bg-amber-50/70 border border-stone-200/70 rounded-lg px-2 py-1 text-xs">
-                <span class="truncate font-medium text-stone-700">${idx + 1}. ${escapeHtml(item.name)}</span>
-                <button onclick="openDeleteModal('${dateStr}', '${item.id}', '${escapeHtml(item.name)}')" 
-                        title="삭제" class="text-stone-400 hover:text-rose-600 font-bold ml-1 px-1">
-                  ×
-                </button>
-              </div>
-            `).join("")}
-          </div>
-        `;
-
-        cell.innerHTML = headerHtml + listHtml;
-        grid.appendChild(cell);
-      }
-    }
-
-    // 신청 모달 열기/닫기
-    function openAddModal(dateStr) {
-      const list = registrations[dateStr] || [];
-      if (list.length >= MAX_CAPACITY) {
-        alert("이미 8명이 모두 등록되어 마감되었습니다.");
-        return;
-      }
-      selectedDateStr = dateStr;
-      document.getElementById("modal-date-label").textContent = `${dateStr} 체험 신청 (현재 ${list.length}/${MAX_CAPACITY}명)`;
-      const input = document.getElementById("applicant-name");
-      input.value = "";
-      document.getElementById("add-modal").classList.remove("hidden");
-      document.getElementById("add-modal").classList.add("flex");
-      setTimeout(() => input.focus(), 50);
-    }
-
-    function closeAddModal() {
-      document.getElementById("add-modal").classList.add("hidden");
-      document.getElementById("add-modal").classList.remove("flex");
-    }
-
-    // 신청 등록 처리
-    async function submitApplicant() {
-      const name = document.getElementById("applicant-name").value.trim();
-      if (!name) {
-        alert("이름을 입력해주세요.");
-        return;
-      }
-
-      if (supabaseClient) {
-        // 동시 접속 8명 초과 방지를 위해 서버에서 현재 인원 재확인
-        const { count } = await supabaseClient
-          .from("sticker_reservations")
-          .select("*", { count: "exact", head: true })
-          .eq("event_date", selectedDateStr);
-
-        if (count >= MAX_CAPACITY) {
-          alert("방금 다른 학생이 신청하여 정원(8명)이 마감되었습니다.");
-          closeAddModal();
-          await loadRegistrations();
-          return;
-        }
-
-        const { error } = await supabaseClient
-          .from("sticker_reservations")
-          .insert([{ event_date: selectedDateStr, student_name: name }]);
-
-        if (error) {
-          alert("등록 중 오류가 발생했습니다: " + error.message);
-          return;
-        }
-        await loadRegistrations();
-      } else {
-        if (!registrations[selectedDateStr]) registrations[selectedDateStr] = [];
-        if (registrations[selectedDateStr].length >= MAX_CAPACITY) {
-          alert("이미 8명이 마감되었습니다.");
-          closeAddModal();
-          return;
-        }
-        registrations[selectedDateStr].push({
-          id: Date.now().toString(),
-          name: name
-        });
-        saveLocal();
-        renderCalendar();
-      }
-
-      closeAddModal();
-    }
-
-    // 삭제 모달 열기/닫기
-    function openDeleteModal(dateStr, id, name) {
-      deleteTarget = { dateStr, id, name };
-      document.getElementById("delete-target-label").textContent = `[${dateStr}] '${name}' 학생의 신청 내역을 삭제합니다.`;
-      const pwInput = document.getElementById("admin-password");
-      pwInput.value = "";
-      document.getElementById("delete-modal").classList.remove("hidden");
-      document.getElementById("delete-modal").classList.add("flex");
-      setTimeout(() => pwInput.focus(), 50);
-    }
-
-    function closeDeleteModal() {
-      document.getElementById("delete-modal").classList.add("hidden");
-      document.getElementById("delete-modal").classList.remove("flex");
-    }
-
-    // 삭제 실행
-    async function confirmDelete() {
-      const pw = document.getElementById("admin-password").value;
-      if (pw !== ADMIN_PW) {
-        alert("비밀번호가 일치하지 않습니다.");
-        return;
-      }
-
-      if (supabaseClient) {
-        const { error } = await supabaseClient
-          .from("sticker_reservations")
-          .delete()
-          .eq("id", deleteTarget.id);
-
-        if (error) {
-          alert("삭제 중 오류가 발생했습니다: " + error.message);
-          return;
-        }
-        await loadRegistrations();
-      } else {
-        registrations[deleteTarget.dateStr] = (registrations[deleteTarget.dateStr] || [])
-          .filter(item => item.id !== deleteTarget.id);
-        saveLocal();
-        renderCalendar();
-      }
-
-      closeDeleteModal();
-    }
-
-    // Enter 키 지원
-    document.getElementById("applicant-name").addEventListener("keydown", e => {
-      if (e.key === "Enter") submitApplicant();
-    });
-    document.getElementById("admin-password").addEventListener("keydown", e => {
-      if (e.key === "Enter") confirmDelete();
-    });
-
-    // XSS 방지
-    function escapeHtml(str) {
-      return str.replace(/[&<>"']/g, m => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-      }[m]));
-    }
-
-    // 시작 시 데이터 로드
-    loadRegistrations();
-  </script>
-</body>
-</html>
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN
+    RAISE EXCEPTION 'supabase_realtime publication을 찾을 수 없습니다. Supabase Realtime 설정을 확인하세요.';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname='supabase_realtime'
+                 AND schemaname='public' AND tablename='sticker_reservations') THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.sticker_reservations;
+  END IF;
+END $$;
+COMMIT;
