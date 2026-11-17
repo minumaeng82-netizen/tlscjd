@@ -1,117 +1,1072 @@
--- Supabase SQL Editor에서 실행하세요. 기존 신청 데이터는 유지합니다.
--- 먼저 아래 한 곳의 새 비밀번호를 반드시 수정하세요. HTML에는 넣지 않습니다.
-BEGIN;
-CREATE SCHEMA IF NOT EXISTS sticker_private;
-REVOKE ALL ON SCHEMA sticker_private FROM PUBLIC, anon, authenticated;
-CREATE TABLE IF NOT EXISTS sticker_private.settings (
-  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-  salt text NOT NULL, password_hash text NOT NULL
-);
-DO $$
-DECLARE
-  new_password text := 'CHANGE_THIS_TO_A_NEW_PASSWORD'; -- 이 따옴표 안을 새 비밀번호로 변경
-  new_salt text := gen_random_uuid()::text;
-BEGIN
-  IF new_password = 'CHANGE_THIS_TO_A_NEW_PASSWORD' OR length(new_password) < 12 THEN
-    RAISE EXCEPTION 'SQL 위쪽 new_password를 12자 이상의 새 관리자 비밀번호로 바꿔 주세요.';
-  END IF;
-  INSERT INTO sticker_private.settings(singleton,salt,password_hash)
-  VALUES(true,new_salt,encode(sha256(convert_to(new_salt || new_password,'UTF8')),'hex'))
-  ON CONFLICT(singleton) DO UPDATE SET salt=EXCLUDED.salt,password_hash=EXCLUDED.password_hash;
-END $$;
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>김천다수초 메이커 체험 신청</title>
 
-CREATE TABLE IF NOT EXISTS public.sticker_reservations (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  event_date date NOT NULL,
-  student_name text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
--- 기존 테이블은 원래 열(id, event_date, student_name, created_at)이 있다는 전제입니다.
-LOCK TABLE public.sticker_reservations IN ACCESS EXCLUSIVE MODE;
-CREATE TABLE IF NOT EXISTS sticker_private.daily_capacity (
-  event_date date PRIMARY KEY,
-  used integer NOT NULL CHECK (used BETWEEN 0 AND 8)
-);
-DO $$ BEGIN
-  IF EXISTS(SELECT 1 FROM public.sticker_reservations GROUP BY event_date HAVING count(*) > 8) THEN
-    RAISE EXCEPTION '이미 8명을 초과한 날짜가 있습니다. 기존 명단을 정리한 후 다시 실행하세요.';
-  END IF;
-END $$;
-DELETE FROM sticker_private.daily_capacity;
-INSERT INTO sticker_private.daily_capacity(event_date,used)
-SELECT event_date,count(*)::integer FROM public.sticker_reservations GROUP BY event_date;
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
-CREATE OR REPLACE FUNCTION sticker_private.enforce_capacity()
-RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
-DECLARE accepted integer;
-BEGIN
-  IF TG_OP = 'INSERT' THEN
-    IF NEW.event_date IS NULL OR NEW.event_date < DATE '2026-11-01'
-       OR NEW.event_date >= DATE '2026-12-01'
-       OR extract(isodow FROM NEW.event_date) IN (6,7) THEN
-      RAISE EXCEPTION '신청 가능한 2026년 11월 평일을 선택하세요.';
-    END IF;
-    NEW.student_name := btrim(NEW.student_name);
-    IF NEW.student_name IS NULL OR length(NEW.student_name) NOT BETWEEN 2 AND 40 THEN
-      RAISE EXCEPTION '학년·반·이름을 2~40자로 입력하세요.';
-    END IF;
-    -- 같은 날짜의 카운터 행을 원자적으로 갱신합니다.
-    -- 동시 요청은 이 행에서 직렬화되며, 실패/롤백 시 증원도 함께 취소됩니다.
-    INSERT INTO sticker_private.daily_capacity AS cap(event_date,used)
-    VALUES(NEW.event_date,1)
-    ON CONFLICT(event_date) DO UPDATE SET used = cap.used + 1 WHERE cap.used < 8
-    RETURNING used INTO accepted;
-    IF accepted IS NULL THEN RAISE EXCEPTION '정원 8명이 마감되었습니다. 다른 날짜를 선택하세요.'; END IF;
-    RETURN NEW;
-  ELSIF TG_OP = 'DELETE' THEN
-    UPDATE sticker_private.daily_capacity SET used = used - 1 WHERE event_date = OLD.event_date;
-    RETURN OLD;
-  ELSE
-    RAISE EXCEPTION '기존 신청은 직접 수정할 수 없습니다. 삭제 후 다시 신청하세요.';
-  END IF;
-END $$;
-DROP TRIGGER IF EXISTS sticker_capacity_guard ON public.sticker_reservations;
-CREATE TRIGGER sticker_capacity_guard BEFORE INSERT OR DELETE OR UPDATE
-ON public.sticker_reservations FOR EACH ROW EXECUTE FUNCTION sticker_private.enforce_capacity();
-CREATE INDEX IF NOT EXISTS sticker_reservations_date_created_idx
-ON public.sticker_reservations(event_date,created_at);
+  <style>
+    * {
+      box-sizing: border-box;
+    }
 
-ALTER TABLE public.sticker_reservations ENABLE ROW LEVEL SECURITY;
--- 이 테이블의 기존 정책을 새 정책으로 교체합니다. 다른 테이블에는 영향이 없습니다.
-DO $$ DECLARE p record; BEGIN
-  FOR p IN SELECT policyname FROM pg_policies
-           WHERE schemaname='public' AND tablename='sticker_reservations' LOOP
-    EXECUTE format('DROP POLICY %I ON public.sticker_reservations', p.policyname);
-  END LOOP;
-END $$;
-REVOKE ALL ON public.sticker_reservations FROM PUBLIC, anon, authenticated;
-GRANT SELECT ON public.sticker_reservations TO anon, authenticated;
-GRANT INSERT(event_date,student_name) ON public.sticker_reservations TO anon, authenticated;
-CREATE POLICY sticker_read ON public.sticker_reservations FOR SELECT TO anon,authenticated USING(true);
-CREATE POLICY sticker_insert ON public.sticker_reservations FOR INSERT TO anon,authenticated WITH CHECK(true);
+    body {
+      margin: 0;
+      background: #fdf8f3;
+      color: #302921;
+      font-family: system-ui, 'Apple SD Gothic Neo', 'Nanum Gothic', sans-serif;
+    }
 
-CREATE OR REPLACE FUNCTION public.delete_sticker_reservation(p_id text,p_password text)
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM sticker_private.settings
-    WHERE singleton AND password_hash=encode(sha256(convert_to(salt || p_password,'UTF8')),'hex')
-  ) THEN RAISE EXCEPTION '관리자 비밀번호가 일치하지 않습니다.'; END IF;
-  DELETE FROM public.sticker_reservations WHERE id::text=p_id;
-  IF NOT FOUND THEN RAISE EXCEPTION '이미 삭제되었거나 존재하지 않는 신청입니다.'; END IF;
-END $$;
-REVOKE ALL ON FUNCTION public.delete_sticker_reservation(text,text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.delete_sticker_reservation(text,text) TO anon,authenticated;
-REVOKE ALL ON ALL TABLES IN SCHEMA sticker_private FROM PUBLIC,anon,authenticated;
-REVOKE ALL ON FUNCTION sticker_private.enforce_capacity() FROM PUBLIC,anon,authenticated;
+    main {
+      max-width: 1150px;
+      margin: auto;
+      padding: 28px 16px;
+    }
 
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN
-    RAISE EXCEPTION 'supabase_realtime publication을 찾을 수 없습니다. Supabase Realtime 설정을 확인하세요.';
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname='supabase_realtime'
-                 AND schemaname='public' AND tablename='sticker_reservations') THEN
-    ALTER PUBLICATION supabase_realtime ADD TABLE public.sticker_reservations;
-  END IF;
-END $$;
-COMMIT;
+    header {
+      background: #805134;
+      color: white;
+      border-radius: 22px;
+      text-align: center;
+      padding: 30px 16px;
+    }
+
+    h1 {
+      font-size: clamp(23px, 4vw, 34px);
+      margin: 10px 0;
+    }
+
+    header p {
+      line-height: 1.65;
+      margin: 8px 0;
+    }
+
+    .eyebrow {
+      color: #ffe0a1;
+      font-size: 14px;
+    }
+
+    #status {
+      display: inline-block;
+      padding: 8px 14px;
+      background: #59341f;
+      border-radius: 30px;
+      font-size: 13px;
+    }
+
+    #message {
+      min-height: 28px;
+      padding: 12px 2px;
+      color: #9b2633;
+      white-space: pre-wrap;
+    }
+
+    .toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin: 10px 0 16px;
+    }
+
+    .toolbar h2 {
+      font-size: 21px;
+      margin: 0;
+    }
+
+    .legend {
+      font-size: 13px;
+      color: #655a50;
+    }
+
+    .week,
+    .calendar {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .week {
+      text-align: center;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .week span {
+      padding: 8px;
+    }
+
+    .sun {
+      color: #b12640;
+    }
+
+    .sat {
+      color: #2455a0;
+    }
+
+    .day {
+      background: white;
+      border: 1px solid #e3d9d0;
+      border-radius: 14px;
+      min-height: 160px;
+      padding: 12px;
+      cursor: pointer;
+      box-shadow: 0 2px 5px #49321a08;
+      transition: box-shadow 0.15s;
+    }
+
+    .day:hover,
+    .day:focus-visible {
+      box-shadow: 0 0 0 3px #aa785455;
+      outline: none;
+    }
+
+    .day.weekend {
+      background: #f5f1ed;
+    }
+
+    .day.full {
+      border-color: #edb2b5;
+      background: #fff5f4;
+    }
+
+    .datehead {
+      display: flex;
+      justify-content: space-between;
+      gap: 3px;
+      align-items: center;
+      border-bottom: 1px solid #eee4dc;
+      padding-bottom: 8px;
+    }
+
+    .count {
+      font-size: 12px;
+      background: #fff0ce;
+      color: #714715;
+      border-radius: 20px;
+      padding: 3px 7px;
+    }
+
+    .full .count {
+      background: #ffe0e1;
+      color: #992638;
+    }
+
+    .preview {
+      margin: 10px 0;
+      padding: 0;
+      list-style: none;
+      font-size: 13px;
+      line-height: 1.9;
+    }
+
+    .preview li {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .small {
+      font-size: 12px;
+      color: #73695e;
+    }
+
+    button {
+      font: inherit;
+      cursor: pointer;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      background: #eee8e2;
+      color: #44382b;
+    }
+
+    button:hover {
+      filter: brightness(0.95);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .primary {
+      background: #805134;
+      color: white;
+      font-weight: 700;
+    }
+
+    .day .primary {
+      padding: 6px 8px;
+      font-size: 12px;
+      width: 100%;
+    }
+
+    .danger {
+      background: #fce8e9;
+      color: #a32236;
+    }
+
+    .footer {
+      line-height: 1.8;
+      font-size: 13px;
+      color: #6c6056;
+      margin-top: 22px;
+    }
+
+    dialog {
+      border: 0;
+      border-radius: 22px;
+      padding: 0;
+      width: min(820px, 94vw);
+      color: #302921;
+      box-shadow: 0 20px 80px #0004;
+    }
+
+    dialog::backdrop {
+      background: #24190eb3;
+    }
+
+    #add-dialog,
+    #delete-dialog {
+      width: min(460px, 94vw);
+    }
+
+    .modalinner {
+      padding: 28px;
+      max-height: 85vh;
+      overflow: auto;
+    }
+
+    .modalhead {
+      display: flex;
+      align-items: start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .modalhead h2 {
+      font-size: clamp(22px, 4vw, 32px);
+      margin: 0 0 10px;
+    }
+
+    .close {
+      font-size: 22px;
+      padding: 4px 12px;
+    }
+
+    .bigcount {
+      font-size: 19px;
+      color: #805134;
+      margin: 0 0 22px;
+    }
+
+    .names {
+      list-style: none;
+      padding: 0;
+      display: grid;
+      gap: 12px;
+    }
+
+    .names li {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      background: #faf5ef;
+      border: 1px solid #e9ded3;
+      padding: 17px;
+      border-radius: 14px;
+    }
+
+    .number {
+      font-size: 20px;
+      color: #805134;
+      font-weight: 800;
+      min-width: 28px;
+    }
+
+    .student {
+      font-size: clamp(21px, 4vw, 29px);
+      font-weight: 700;
+      overflow-wrap: anywhere;
+      flex: 1;
+    }
+
+    .names button {
+      font-size: 13px;
+      flex-shrink: 0;
+    }
+
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    label {
+      display: block;
+      margin: 18px 0 8px;
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    input {
+      display: block;
+      width: 100%;
+      font: inherit;
+      border: 1px solid #cdbeb0;
+      border-radius: 10px;
+      padding: 13px;
+      font-size: 18px;
+    }
+
+    input:focus {
+      outline: 3px solid #d5b899;
+    }
+
+    #refresh {
+      white-space: nowrap;
+      font-size: 13px;
+    }
+
+    .empty {
+      padding: 20px;
+      background: #faf5ef;
+      border-radius: 12px;
+      font-size: 19px;
+      line-height: 1.6;
+    }
+
+    @media (max-width: 640px) {
+      main {
+        padding: 16px 8px;
+      }
+
+      .week,
+      .calendar {
+        gap: 3px;
+      }
+
+      .day {
+        padding: 5px;
+        min-height: 124px;
+        border-radius: 8px;
+      }
+
+      .datehead {
+        flex-direction: column;
+        align-items: start;
+      }
+
+      .preview {
+        font-size: 10px;
+        line-height: 1.7;
+        margin: 5px 0;
+      }
+
+      .count {
+        font-size: 10px;
+        padding: 2px 4px;
+      }
+
+      .day .primary {
+        font-size: 10px;
+        padding: 6px 0;
+      }
+
+      .small {
+        font-size: 10px;
+      }
+
+      .toolbar {
+        align-items: start;
+        flex-wrap: wrap;
+      }
+
+      .toolbar h2 {
+        font-size: 18px;
+      }
+
+      .legend {
+        font-size: 11px;
+      }
+
+      .modalinner {
+        padding: 20px;
+      }
+
+      .names li {
+        padding: 13px 10px;
+        gap: 8px;
+      }
+
+      .names button {
+        padding: 8px;
+      }
+
+      .week span {
+        padding: 6px 0;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">김천다수초등학교 메이커 프로그램</p>
+      <h1>나만의 스티커 만들기 체험 신청</h1>
+      <p>평일 하루 8명 · 날짜를 누르면 큰 신청자 명단이 열립니다.</p>
+
+      <div id="status" role="status" aria-live="polite">
+        연결 확인 중…
+      </div>
+    </header>
+
+    <div id="message" role="alert"></div>
+
+    <div class="toolbar">
+      <h2>2026년 11월 체험 일정표</h2>
+
+      <span class="legend">
+        날짜 클릭: 명단 확대 · 주말 신청 불가
+      </span>
+
+      <button id="refresh" type="button">새로고침</button>
+    </div>
+
+    <div class="week" aria-hidden="true">
+      <span class="sun">일</span>
+      <span>월</span>
+      <span>화</span>
+      <span>수</span>
+      <span>목</span>
+      <span>금</span>
+      <span class="sat">토</span>
+    </div>
+
+    <div
+      id="calendar"
+      class="calendar"
+      aria-label="11월 체험 달력"
+    ></div>
+
+    <p class="footer">
+      동시에 신청해도 서버에서 먼저 처리된 8명만 등록됩니다.
+      남은 자리가 표시되어도 등록 처리 시점에 마감될 수 있습니다.
+      <br>
+      신청자의 학년·반·이름이 접속자에게 표시됩니다.
+      학교에서 허용한 범위에만 주소를 공유해 주세요.
+    </p>
+  </main>
+
+  <!-- 날짜별 확대 명단 -->
+  <dialog id="detail-dialog" aria-labelledby="detail-title">
+    <div class="modalinner">
+      <div class="modalhead">
+        <h2 id="detail-title"></h2>
+
+        <button
+          class="close"
+          data-close="detail-dialog"
+          aria-label="명단 닫기"
+        >
+          ×
+        </button>
+      </div>
+
+      <p
+        id="detail-count"
+        class="bigcount"
+        aria-live="polite"
+      ></p>
+
+      <ol id="names" class="names"></ol>
+
+      <div class="actions">
+        <button data-close="detail-dialog">닫기</button>
+        <button id="detail-add" class="primary">
+          이 날짜에 신청하기
+        </button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- 신청 입력 -->
+  <dialog id="add-dialog" aria-labelledby="add-title">
+    <div class="modalinner">
+      <h2 id="add-title">체험 신청하기</h2>
+      <p id="add-date"></p>
+
+      <form id="add-form">
+        <label for="name">학년·반·이름</label>
+
+        <input
+          id="name"
+          placeholder="예: 4-2 홍길동"
+          minlength="2"
+          maxlength="40"
+          required
+          autocomplete="off"
+        >
+
+        <div class="actions">
+          <button type="button" data-close="add-dialog">
+            취소
+          </button>
+
+          <button id="submit" class="primary" type="submit">
+            등록하기
+          </button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <!-- 관리자 삭제 -->
+  <dialog id="delete-dialog" aria-labelledby="delete-title">
+    <div class="modalinner">
+      <h2 id="delete-title">신청 내역 삭제</h2>
+      <p id="delete-label"></p>
+
+      <form id="delete-form">
+        <label for="password">관리자 비밀번호</label>
+
+        <input
+          id="password"
+          type="password"
+          required
+          autocomplete="off"
+        >
+
+        <div class="actions">
+          <button type="button" data-close="delete-dialog">
+            취소
+          </button>
+
+          <button
+            id="delete-submit"
+            class="danger"
+            type="submit"
+          >
+            삭제하기
+          </button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <script>
+    'use strict';
+
+    // Supabase 연결 정보
+    const SUPABASE_URL =
+      'https://thouylmffwzguocsrsvy.supabase.co';
+
+    const SUPABASE_ANON_KEY =
+      'sb_publishable_9Vrx2eDjvWkCj4MQSG_KQg_kw8DjQmg';
+
+    // 관리자 비밀번호는 HTML에 저장하지 않습니다.
+    // Supabase SQL에서 설정한 비밀번호를 사용합니다.
+
+    const MAX = 8;
+    const START = '2026-11-01';
+    const END = '2026-12-01';
+
+    const $ = id => document.getElementById(id);
+
+    let db;
+    let rows = [];
+
+    let ready = false;
+    let live = false;
+    let busy = false;
+    let deleting = false;
+
+    let detailDate = '';
+    let addDate = '';
+    let deleteTarget = null;
+
+    let loading = false;
+    let again = false;
+    let timer;
+
+    function status() {
+      $('status').textContent = !ready
+        ? '⚠ 데이터 연결 확인 필요'
+        : live
+          ? '🟢 실시간 동기화 중'
+          : '🟡 연결 복구 중 · 15초 간격으로 새로고침';
+    }
+
+    function message(text = '') {
+      $('message').textContent = text;
+    }
+
+    function listFor(date) {
+      return rows.filter(row => row.event_date === date);
+    }
+
+    function weekday(date) {
+      return new Date(
+        date + 'T12:00:00+09:00'
+      ).getUTCDay();
+    }
+
+    function dateLabel(date) {
+      const month = Number(date.slice(5, 7));
+      const day = Number(date.slice(8, 10));
+      const dayName = '일월화수목금토'[weekday(date)];
+
+      return `${month}월 ${day}일 (${dayName})`;
+    }
+
+    function weekend(date) {
+      return [0, 6].includes(weekday(date));
+    }
+
+    // 사용자 입력은 innerHTML이 아닌 textContent로 표시합니다.
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+
+      if (className) {
+        node.className = className;
+      }
+
+      if (text !== undefined) {
+        node.textContent = text;
+      }
+
+      return node;
+    }
+
+    function openDialog(id) {
+      if (!$(id).open) {
+        $(id).showModal();
+      }
+    }
+
+    // 달력 렌더링
+    // 2026년 11월 1일은 일요일이므로 앞쪽 빈칸이 없습니다.
+    function render() {
+      const grid = $('calendar');
+      grid.replaceChildren();
+
+      for (let day = 1; day <= 30; day++) {
+        const date =
+          `2026-11-${String(day).padStart(2, '0')}`;
+
+        const list = listFor(date);
+        const full = list.length >= MAX;
+        const isWeekend = weekend(date);
+
+        const cell = el(
+          'article',
+          `day${full ? ' full' : ''}` +
+          `${isWeekend ? ' weekend' : ''}`
+        );
+
+        cell.tabIndex = 0;
+        cell.setAttribute('role', 'button');
+        cell.setAttribute(
+          'aria-label',
+          `${dateLabel(date)}, ${list.length}명 신청. 명단 보기`
+        );
+
+        const head = el('div', 'datehead');
+
+        const dateClass = weekday(date) === 0
+          ? 'sun'
+          : weekday(date) === 6
+            ? 'sat'
+            : '';
+
+        head.append(
+          el('strong', dateClass, String(day)),
+          el('span', 'count', `${list.length}/8`)
+        );
+
+        cell.append(head);
+
+        const preview = el('ul', 'preview');
+
+        list.slice(0, 3).forEach(row => {
+          preview.append(
+            el('li', '', row.student_name)
+          );
+        });
+
+        if (list.length > 3) {
+          preview.append(
+            el(
+              'li',
+              '',
+              `외 ${list.length - 3}명 · 확대 보기`
+            )
+          );
+        }
+
+        cell.append(preview);
+
+        if (!isWeekend && !full) {
+          const button = el('button', 'primary', '＋ 신청');
+          button.disabled = !ready;
+
+          button.addEventListener('click', event => {
+            event.stopPropagation();
+            openAdd(date);
+          });
+
+          cell.append(button);
+        } else {
+          cell.append(
+            el(
+              'span',
+              'small',
+              isWeekend ? '주말' : '정원 마감'
+            )
+          );
+        }
+
+        cell.addEventListener('click', () => {
+          openDetail(date);
+        });
+
+        cell.addEventListener('keydown', event => {
+          if (
+            event.target === cell &&
+            ['Enter', ' '].includes(event.key)
+          ) {
+            event.preventDefault();
+            openDetail(date);
+          }
+        });
+
+        grid.append(cell);
+      }
+
+      renderDetail();
+    }
+
+    // 날짜별 확대 명단
+    function openDetail(date) {
+      detailDate = date;
+      renderDetail();
+      openDialog('detail-dialog');
+    }
+
+    function renderDetail() {
+      if (!detailDate) return;
+
+      const list = listFor(detailDate);
+
+      $('detail-title').textContent =
+        `${dateLabel(detailDate)} 신청자 명단`;
+
+      $('detail-count').textContent =
+        `${list.length}명 / 정원 8명` +
+        (list.length >= MAX ? ' · 마감' : '');
+
+      const names = $('names');
+      names.replaceChildren();
+
+      if (!list.length) {
+        names.append(
+          el('li', 'empty', '아직 신청한 학생이 없습니다.')
+        );
+      }
+
+      list.forEach((row, index) => {
+        const item = el('li');
+        const deleteButton = el(
+          'button',
+          'danger',
+          '삭제'
+        );
+
+        deleteButton.addEventListener('click', () => {
+          openDelete(row);
+        });
+
+        item.append(
+          el('span', 'number', `${index + 1}.`),
+          el('span', 'student', row.student_name),
+          deleteButton
+        );
+
+        names.append(item);
+      });
+
+      $('detail-add').disabled =
+        !ready ||
+        weekend(detailDate) ||
+        list.length >= MAX;
+
+      $('detail-add').textContent = weekend(detailDate)
+        ? '주말은 신청할 수 없어요'
+        : list.length >= MAX
+          ? '정원 8명 마감'
+          : '이 날짜에 신청하기';
+    }
+
+    // 최신 데이터 조회
+    async function load() {
+      if (!db) return;
+
+      if (loading) {
+        again = true;
+        return;
+      }
+
+      loading = true;
+
+      try {
+        const { data, error } = await db
+          .from('sticker_reservations')
+          .select('id,event_date,student_name,created_at')
+          .gte('event_date', START)
+          .lt('event_date', END)
+          .order('created_at', { ascending: true })
+          .order('id', { ascending: true });
+
+        if (error) throw error;
+
+        rows = data || [];
+        ready = true;
+
+        message();
+        render();
+      } catch (error) {
+        ready = false;
+
+        message(
+          '신청 내역을 불러오지 못했습니다. ' +
+          'SQL 설정과 네트워크를 확인한 후 새로고침해 주세요.\n' +
+          error.message
+        );
+
+        render();
+      } finally {
+        loading = false;
+        status();
+
+        if (again) {
+          again = false;
+          void load();
+        }
+      }
+    }
+
+    function scheduleLoad() {
+      clearTimeout(timer);
+      timer = setTimeout(() => void load(), 150);
+    }
+
+    // 신청 창 열기
+    function openAdd(date) {
+      if (!ready) {
+        alert('데이터 연결을 먼저 확인해 주세요.');
+        return;
+      }
+
+      if (weekend(date)) return;
+
+      if (listFor(date).length >= MAX) {
+        alert('이미 정원 8명이 마감되었습니다.');
+        return;
+      }
+
+      if (busy) return;
+
+      addDate = date;
+
+      $('add-date').textContent =
+        `${dateLabel(date)} · 현재 ${listFor(date).length}/8명`;
+
+      $('name').value = '';
+
+      openDialog('add-dialog');
+      $('name').focus();
+    }
+
+    // 신청 처리
+    $('add-form').addEventListener('submit', async event => {
+      event.preventDefault();
+
+      if (busy || !ready) return;
+
+      const name = $('name').value.trim();
+
+      if (name.length < 2 || name.length > 40) {
+        alert('학년·반·이름을 2~40자로 입력하세요.');
+        return;
+      }
+
+      const date = addDate;
+
+      busy = true;
+      $('submit').disabled = true;
+      $('submit').textContent = '등록 중…';
+
+      try {
+        // 정원 확인과 차단은 SQL의 DB 트리거에서 처리합니다.
+        const { error } = await db
+          .from('sticker_reservations')
+          .insert({
+            event_date: date,
+            student_name: name
+          });
+
+        if (error) throw error;
+
+        $('add-dialog').close();
+
+        await load();
+        openDetail(date);
+      } catch (error) {
+        alert(
+          '신청하지 못했습니다: ' + error.message +
+          '\n네트워크 오류라면 재시도 전에 명단에서 ' +
+          '등록 여부를 확인해 주세요.'
+        );
+
+        await load();
+      } finally {
+        busy = false;
+        $('submit').disabled = false;
+        $('submit').textContent = '등록하기';
+      }
+    });
+
+    // 삭제 창 열기
+    function openDelete(row) {
+      if (deleting) return;
+
+      deleteTarget = row;
+
+      $('delete-label').textContent =
+        `${dateLabel(row.event_date)} · ` +
+        `${row.student_name} 신청을 삭제합니다.`;
+
+      $('password').value = '';
+
+      openDialog('delete-dialog');
+      $('password').focus();
+    }
+
+    // 서버에서 관리자 비밀번호 확인 후 삭제
+    $('delete-form').addEventListener('submit', async event => {
+      event.preventDefault();
+
+      if (deleting || !deleteTarget) return;
+
+      deleting = true;
+      $('delete-submit').disabled = true;
+
+      try {
+        const { error } = await db.rpc(
+          'delete_sticker_reservation',
+          {
+            p_id: String(deleteTarget.id),
+            p_password: $('password').value
+          }
+        );
+
+        if (error) throw error;
+
+        $('password').value = '';
+        $('delete-dialog').close();
+
+        await load();
+      } catch (error) {
+        alert('삭제하지 못했습니다: ' + error.message);
+      } finally {
+        deleting = false;
+        $('delete-submit').disabled = false;
+      }
+    });
+
+    $('detail-add').addEventListener('click', () => {
+      openAdd(detailDate);
+    });
+
+    $('refresh').addEventListener('click', () => {
+      void load();
+    });
+
+    document.querySelectorAll('[data-close]').forEach(button => {
+      button.addEventListener('click', () => {
+        $(button.dataset.close).close();
+      });
+    });
+
+    $('delete-dialog').addEventListener('close', () => {
+      $('password').value = '';
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        void load();
+      }
+    });
+
+    window.addEventListener('online', () => {
+      void load();
+    });
+
+    // 초기 화면 표시
+    render();
+
+    // Supabase 연결 및 실시간 동기화
+    try {
+      if (!window.supabase) {
+        throw new Error(
+          'Supabase 라이브러리를 불러오지 못했습니다. ' +
+          '인터넷 연결을 확인하세요.'
+        );
+      }
+
+      db = window.supabase.createClient(
+        SUPABASE_URL,
+        SUPABASE_ANON_KEY
+      );
+
+      // 신청·삭제·수정 이벤트를 받아 전체 명단을 다시 조회합니다.
+      // 구독 직후에도 조회하여 초기 연결 중 변경된 데이터를 반영합니다.
+      db.channel('sticker-calendar-nov2026')
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'sticker_reservations'
+          },
+          scheduleLoad
+        )
+        .subscribe(state => {
+          live = state === 'SUBSCRIBED';
+          status();
+
+          if (live) {
+            void load();
+          }
+        });
+
+      void load();
+
+      // 연결 유실이나 이벤트 누락에 대비한 보조 새로고침
+      setInterval(() => {
+        if (!document.hidden) {
+          void load();
+        }
+      }, 15000);
+    } catch (error) {
+      message(error.message);
+      status();
+    }
+  </script>
+</body>
+</html>
